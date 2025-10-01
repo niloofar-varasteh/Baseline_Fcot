@@ -1,31 +1,22 @@
-# fecot/strategy.py
+# strategy.py
 from __future__ import annotations
 import json
+from typing import List, Tuple
 import numpy as np
-from typing import Dict, List, Optional, Tuple
 import flwr as fl
-from flwr.common import EvaluateRes, FitRes, Metrics
+from flwr.common import FitRes, Metrics
 
-CONF_THRESHOLD = 0.7  # confidence gate for a valid vote
-
-def majority_vote(preds: np.ndarray, confs: np.ndarray, conf_thresh: float = CONF_THRESHOLD) -> np.ndarray:
-    # preds, confs: shape [num_clients, U]
-    num_clients, U = preds.shape
-    maj = np.zeros(U, dtype=int)
+def majority_vote(pred_matrix: np.ndarray) -> np.ndarray:
+    # pred_matrix: [C, U]  -> output: [U]
+    C, U = pred_matrix.shape
+    out = np.zeros(U, dtype=int)
     for i in range(U):
-        # consider only votes above confidence threshold
-        valid_idx = confs[:, i] >= conf_thresh
-        votes = preds[valid_idx, i]
-        if votes.size == 0:
-            # no confident votes → fall back to plain majority over all
-            votes = preds[:, i]
-        # argmax over counts
-        labels, counts = np.unique(votes, return_counts=True)
-        maj[i] = labels[np.argmax(counts)]
-    return maj
+        labels, counts = np.unique(pred_matrix[:, i], return_counts=True)
+        out[i] = labels[np.argmax(counts)]
+    return out
 
 class FecotStrategy(fl.server.strategy.FedAvg):
-    """FedAvg + server-side co-training consensus logging."""
+    """FedAvg + log predictions of U and perform majority voting on the server."""
 
     def aggregate_fit(
         self,
@@ -33,31 +24,29 @@ class FecotStrategy(fl.server.strategy.FedAvg):
         results: List[Tuple[fl.server.client_proxy.ClientProxy, FitRes]],
         failures: List[BaseException],
     ):
-        # Call FedAvg to aggregate weights
-        agg_parameters, agg_metrics = super().aggregate_fit(server_round, results, failures)
+        # Aggregate weights same as FedAvg
+        agg_params, agg_metrics = super().aggregate_fit(server_round, results, failures)
 
-        # Collect per-client predictions on the unlabeled pool (sent via fit metrics)
-        client_preds, client_confs = [], []
+        # Collect predictions of U from client metrics
+        preds = []
         for _, fit_res in results:
             m: Metrics = fit_res.metrics or {}
-            if "u_preds" in m and "u_confs" in m:
-                client_preds.append(np.array(json.loads(m["u_preds"]), dtype=int))
-                client_confs.append(np.array(json.loads(m["u_confs"]), dtype=float))
+            if "u_preds" in m:
+                preds.append(np.array(json.loads(m["u_preds"]), dtype=int))
 
-        if client_preds:
-            P = np.stack(client_preds)      # [C, U]
-            C = np.stack(client_confs)      # [C, U]
-            maj = majority_vote(P, C, CONF_THRESHOLD)
+        if preds:
+            P = np.stack(preds)             # [C, U=20]
+            maj = majority_vote(P)          # [U=20]
 
-            # Debug prints per round
+            # Debug log (exactly what you requested)
             print(f"\n=== Round {server_round} FCoT Debug ===")
-            for ci, (p, c) in enumerate(zip(P, C), start=1):
-                print(f"[Client {ci}] preds={p.tolist()} confs={[round(x,3) for x in c.tolist()]}")
+            for ci, p in enumerate(P, start=1):
+                print(f"[Client {ci}] preds={p.tolist()}")
             print(f"[Majority] {maj.tolist()}\n")
 
-            # Save final consensus on last round
-            if self._num_rounds is not None and server_round == self._num_rounds:
+            # On the final round, save the final output
+            if getattr(self, "_num_rounds", None) == server_round:
                 with open(f"fecot_consensus_round{server_round}.json", "w", encoding="utf-8") as f:
                     json.dump({"majority": maj.tolist()}, f, ensure_ascii=False, indent=2)
 
-        return agg_parameters, agg_metrics
+        return agg_params, agg_metrics
